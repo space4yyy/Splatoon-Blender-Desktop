@@ -1,0 +1,385 @@
+name: Build offline desktop releases
+
+on:
+  schedule:
+    # Poll every 15 minutes, away from the top of the hour when Actions is busiest.
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or commit in the source repository (blank uses source.json)
+        required: false
+        type: string
+      force:
+        description: Rebuild even when this source commit already has a release
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-desktop-release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      source-repository: ${{ steps.resolve.outputs.source-repository }}
+      source-ref: ${{ steps.resolve.outputs.source-ref }}
+      source-sha: ${{ steps.resolve.outputs.source-sha }}
+      previous-source-sha: ${{ steps.resolve.outputs.previous-source-sha }}
+      previous-resource-tag: ${{ steps.resolve.outputs.previous-resource-tag }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve source commit and last successful release
+        id: resolve
+        uses: actions/github-script@v9
+        env:
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          FORCE_BUILD: ${{ inputs.force }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const config = JSON.parse(fs.readFileSync('source.json', 'utf8'));
+            const [owner, repo] = config.repository.split('/');
+            if (!owner || !repo) throw new Error('source.json repository must be OWNER/REPO');
+
+            const ref = process.env.SOURCE_REF_INPUT || config.defaultRef || 'main';
+            const commit = await github.rest.repos.getCommit({ owner, repo, ref });
+            const sourceSha = commit.data.sha;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            const successful = releases
+              .filter(r => !r.draft && !r.prerelease && r.tag_name.startsWith('desktop-'))
+              .map(r => {
+                const body = r.body || '';
+                return {
+                  release: r,
+                  sourceSha: body.match(/^Source-Commit:\s*([0-9a-f]{40})\s*$/mi)?.[1] || '',
+                  resourceTag: body.match(/^Resource-Tag:\s*([A-Za-z0-9._-]+)\s*$/mi)?.[1] || '',
+                };
+              })
+              .filter(r => r.sourceSha)
+              .sort((a, b) => Date.parse(b.release.published_at || b.release.created_at)
+                - Date.parse(a.release.published_at || a.release.created_at));
+
+            const previous = successful[0] || { sourceSha: '', resourceTag: '' };
+            const force = process.env.FORCE_BUILD === 'true';
+            const skip = sourceSha === previous.sourceSha && !force;
+            core.setOutput('source-repository', config.repository);
+            core.setOutput('source-ref', ref);
+            core.setOutput('source-sha', sourceSha);
+            core.setOutput('previous-source-sha', previous.sourceSha);
+            core.setOutput('previous-resource-tag', previous.resourceTag);
+            core.setOutput('skip', String(skip));
+            core.info(`Source: ${config.repository}@${ref} (${sourceSha})`);
+            core.info(previous.sourceSha
+              ? `Last published source: ${previous.sourceSha}; resource release: ${previous.resourceTag || '(missing)'}`
+              : 'No successful desktop release exists yet.');
+            core.info(skip ? 'No new source commit; skipping.' : 'A build is required.');
+
+  resources:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.pack.outputs.tag || steps.reuse.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.resolve.outputs.source-repository }}
+          ref: ${{ needs.resolve.outputs.source-sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check whether resource inputs changed
+        id: change
+        env:
+          PREVIOUS_RESOURCE_TAG: ${{ needs.resolve.outputs.previous-resource-tag }}
+        run: |
+          python scripts/resource_changed.py source "$PREVIOUS_RESOURCE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build a changed resource pack
+        id: pack
+        if: steps.change.outputs.changed == 'true'
+        run: |
+          python source/scripts/pack-resources.py
+
+          zip_file=$(find source/offline-release -maxdepth 1 -type f -name '*.zip' -print -quit)
+          manifest_file=$(find source/offline-release -maxdepth 1 -type f -name '*.manifest.json' -print -quit)
+          checksum_file=$(find source/offline-release -maxdepth 1 -type f -name '*.zip.sha256' -print -quit)
+          test -n "$zip_file" && test -n "$manifest_file" && test -n "$checksum_file"
+
+          resource_id=$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["id"])' "$manifest_file")
+          resource_tag="resources-v1-${resource_id}"
+          python - "$zip_file" "$manifest_file" "$checksum_file" <<'PY'
+          import pathlib, sys
+          limit = 2 * 1024**3
+          for name in sys.argv[1:]:
+              size = pathlib.Path(name).stat().st_size
+              if size >= limit:
+                  raise SystemExit(f"Release asset must be under 2 GiB: {name} ({size} bytes)")
+          PY
+
+          echo "tag=$resource_tag" >> "$GITHUB_OUTPUT"
+          echo "resource_id=$resource_id" >> "$GITHUB_OUTPUT"
+
+      - name: Create or complete the changed resource release
+        if: steps.change.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESOURCE_TAG: ${{ steps.pack.outputs.tag }}
+          RESOURCE_ID: ${{ steps.pack.outputs.resource_id }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
+        run: |
+          zip_file=$(find source/offline-release -maxdepth 1 -type f -name '*.zip' -print -quit)
+          manifest_file=$(find source/offline-release -maxdepth 1 -type f -name '*.manifest.json' -print -quit)
+          checksum_file=$(find source/offline-release -maxdepth 1 -type f -name '*.zip.sha256' -print -quit)
+
+          if gh release view "$RESOURCE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,assets --jq '{isDraft: .isDraft, assets: [.assets[].name]}' \
+            > /tmp/resource-release.json 2>/dev/null; then
+            for file in "$zip_file" "$manifest_file" "$checksum_file"; do
+              asset=$(basename "$file")
+              if ! grep -Fq "\"$asset\"" /tmp/resource-release.json; then
+                gh release upload "$RESOURCE_TAG" "$file" \
+                  --repo "$GITHUB_REPOSITORY" --clobber
+              fi
+            done
+            if [[ $(jq -r '.isDraft' /tmp/resource-release.json) == 'true' ]]; then
+              gh release edit "$RESOURCE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --draft=false --prerelease
+            fi
+          else
+            cat > /tmp/resource-release-notes.md <<EOF
+          共用离线资源包。应用程序更新时若资源未变化，会继续引用此版本。
+
+          Source-Commit: ${SOURCE_SHA}
+          Resource-Id: ${RESOURCE_ID}
+          EOF
+            gh release create "$RESOURCE_TAG" "$zip_file" "$manifest_file" "$checksum_file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "离线资源 v1 · ${RESOURCE_ID:0:12}" \
+              --notes-file /tmp/resource-release-notes.md \
+              --prerelease --latest=false
+          fi
+
+      - name: Reuse the resource release from the previous desktop build
+        id: reuse
+        if: steps.change.outputs.changed != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESOURCE_TAG: ${{ needs.resolve.outputs.previous-resource-tag }}
+        run: |
+          if [[ -z "$RESOURCE_TAG" ]]; then
+            echo 'No prior resource release is recorded.' >&2
+            exit 1
+          fi
+          gh release view "$RESOURCE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          echo "tag=$RESOURCE_TAG" >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.resolve.outputs.source-repository }}
+          ref: ${{ needs.resolve.outputs.source-sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install JavaScript dependencies
+        working-directory: source
+        run: npm ci
+
+      - name: Build universal macOS app and DMG
+        working-directory: source
+        run: npm run desktop:build:macos -- --bundles app,dmg --ci
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-dmg-${{ needs.resolve.outputs.source-sha }}
+          path: source/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.resolve.outputs.source-repository }}
+          ref: ${{ needs.resolve.outputs.source-sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+
+      - name: Install JavaScript dependencies
+        working-directory: source
+        run: npm ci
+
+      - name: Build Windows x64 installer with offline WebView2 runtime
+        working-directory: source
+        run: npm run desktop:build:windows -- --ci
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64-${{ needs.resolve.outputs.source-sha }}
+          path: source/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*_x64-setup.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [resolve, resources, build-macos, build-windows]
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ needs.resolve.outputs.source-repository }}
+          ref: ${{ needs.resolve.outputs.source-sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos-dmg-${{ needs.resolve.outputs.source-sha }}
+          path: artifacts/macos
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-x64-${{ needs.resolve.outputs.source-sha }}
+          path: artifacts/windows
+
+      - name: Prepare checksums and release notes
+        id: metadata
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
+          RESOURCE_TAG: ${{ needs.resources.outputs.tag }}
+        run: |
+          mac_dmg=$(find artifacts/macos -maxdepth 1 -type f -name '*.dmg' -print -quit)
+          windows_exe=$(find artifacts/windows -maxdepth 1 -type f -name '*.exe' -print -quit)
+          test -n "$mac_dmg" && test -n "$windows_exe"
+
+          version=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("source/src-tauri/tauri.conf.json", "utf8")).version)')
+          release_tag="desktop-v${version}-${SOURCE_SHA:0:12}-run${GITHUB_RUN_NUMBER}-attempt${GITHUB_RUN_ATTEMPT}"
+          python - "$mac_dmg" "$windows_exe" <<'PY'
+          import pathlib, sys
+          limit = 2 * 1024**3
+          for name in sys.argv[1:]:
+              size = pathlib.Path(name).stat().st_size
+              if size >= limit:
+                  raise SystemExit(f"Release asset must be under 2 GiB: {name} ({size} bytes)")
+          PY
+          mac_name=$(basename "$mac_dmg")
+          windows_name=$(basename "$windows_exe")
+          cp "$mac_dmg" "artifacts/$mac_name"
+          cp "$windows_exe" "artifacts/$windows_name"
+          (cd artifacts && sha256sum "$mac_name" "$windows_name" > SHA256SUMS.txt)
+
+          cat > artifacts/使用说明.txt <<EOF
+          Splatoon Blender ${version} 离线版
+
+          首次使用：
+          1. macOS 使用 DMG 安装，Windows 使用 setup.exe 安装。
+          2. 下载离线资源包：
+             https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RESOURCE_TAG}
+          3. 打开应用并导入资源 ZIP，无需自行解压。
+
+          程序更新复用已导入的资源，不必重复下载资源 ZIP。
+          Windows 安装包包含 WebView2 离线运行环境。
+          macOS 通用版支持 Apple Silicon 和 Intel；Windows 版为 x64。
+          程序未签名或 Apple 公证。
+          EOF
+
+          cat > artifacts/release-notes.md <<EOF
+          Splatoon Blender ${version} 离线桌面版。
+
+          - macOS 通用版：Apple Silicon 与 Intel
+          - Windows x64 安装程序（包含 WebView2 离线运行环境）
+          - 离线资源包单独发布；资源不变时复用同一资源版本
+          - 安装程序未签名，macOS 版本未经过 Apple 公证
+
+          [下载资源包](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RESOURCE_TAG})
+
+          Source-Commit: ${SOURCE_SHA}
+          Resource-Tag: ${RESOURCE_TAG}
+          EOF
+
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "title=Splatoon Blender ${version} (${SOURCE_SHA:0:12})" >> "$GITHUB_OUTPUT"
+          echo "mac_dmg=artifacts/$mac_name" >> "$GITHUB_OUTPUT"
+          echo "windows_exe=artifacts/$windows_name" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the desktop release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.metadata.outputs.title }}
+          MAC_DMG: ${{ steps.metadata.outputs.mac_dmg }}
+          WINDOWS_EXE: ${{ steps.metadata.outputs.windows_exe }}
+        run: |
+          gh release create "$RELEASE_TAG" "$MAC_DMG" "$WINDOWS_EXE" \
+            artifacts/SHA256SUMS.txt artifacts/使用说明.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TITLE" \
+            --notes-file artifacts/release-notes.md \
+            --latest
