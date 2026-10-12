@@ -73,7 +73,10 @@ jobs:
                   resourceTag: body.match(/^Resource-Tag:\s*([A-Za-z0-9._-]+)\s*$/mi)?.[1] || '',
                 };
               })
-              .filter(r => r.desktopSha && r.sourceSha)
+              // The first release created before the desktop split recorded
+              // Source-Commit and Resource-Tag, but not Desktop-Commit. Keep
+              // it as a baseline so its resource pack can still be reused.
+              .filter(r => r.sourceSha)
               .sort((a, b) => Date.parse(b.release.published_at || b.release.created_at)
                 - Date.parse(a.release.published_at || a.release.created_at));
 

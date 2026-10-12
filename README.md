@@ -41,7 +41,7 @@ npm run desktop:dev
 - `source.json`：网页仓库和默认分支。
 - `src-tauri/`：桌面应用原生层、图标、安装器和配置。
 - `scripts/`：桌面离线 Vite 构建、资源打包和差异检查。
-- `scripts/resource_changed.py`：计算网页资源内容 ID，并与上次发布的资源标签比较；网页提交变化但资源内容未变时会复用原资源包。
+- `scripts/resource_changed.py`：使用本仓库的 `offline-resources.json` 选取网页仓库中的资源并计算内容 ID；网页提交变化但资源内容未变时会复用原资源包。
 
 每个 GitHub Release 中的单个文件必须小于 2 GiB。工作流会在上传前检查该限制；若 ZIP 超过限制，需要把资源包拆分后再调整应用导入和发布流程。
 

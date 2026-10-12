@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compute the offline resource identity and compare it with the last release."""
+"""Compute the selected web resources' identity and compare it with the last release."""
 
 import hashlib
 import json
@@ -21,7 +21,10 @@ def main() -> int:
 
     source = Path(sys.argv[1]).resolve()
     previous_tag = sys.argv[2]
-    config_path = source / "offline-resources.json"
+    # The resource selection belongs to this desktop repository. The source
+    # directory is the separately checked out web repository and no longer
+    # contains desktop build configuration.
+    config_path = Path(__file__).resolve().parents[1] / "offline-resources.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
 
     files = []
