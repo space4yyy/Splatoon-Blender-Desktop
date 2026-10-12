@@ -1,0 +1,23 @@
+{
+  "name": "splatoon-blender-desktop",
+  "version": "1.1.2",
+  "private": true,
+  "description": "Tauri desktop application for Splatoon Blender",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/space4yyy/Splatoon-Blender-Desktop.git"
+  },
+  "scripts": {
+    "dev:web": "npm --prefix web run dev -- --config ../scripts/vite.desktop.config.mjs --host 127.0.0.1 --strictPort",
+    "build:web": "node scripts/build-desktop.mjs",
+    "desktop:dev": "node scripts/run-tauri.mjs dev",
+    "desktop:build": "node scripts/run-tauri.mjs build",
+    "desktop:build:macos": "node scripts/run-tauri.mjs build --target universal-apple-darwin",
+    "desktop:build:windows": "node scripts/build-windows.mjs",
+    "desktop:pack:resources": "python3 scripts/pack-resources.py",
+    "desktop:release:collect": "node scripts/collect-offline-release.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.5"
+  }
+}

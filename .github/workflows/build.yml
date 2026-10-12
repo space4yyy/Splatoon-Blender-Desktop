@@ -1,17 +1,19 @@
 name: Build offline desktop releases
 
 on:
+  push:
+    branches: [main]
   schedule:
     # Poll every 15 minutes, away from the top of the hour when Actions is busiest.
     - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Branch, tag, or commit in the source repository (blank uses source.json)
+        description: Branch, tag, or commit in the web repository (blank uses source.json)
         required: false
         type: string
       force:
-        description: Rebuild even when this source commit already has a release
+        description: Rebuild even when these commits already have a release
         required: false
         default: false
         type: boolean
@@ -27,9 +29,11 @@ jobs:
   resolve:
     runs-on: ubuntu-latest
     outputs:
+      desktop-sha: ${{ steps.resolve.outputs.desktop-sha }}
       source-repository: ${{ steps.resolve.outputs.source-repository }}
       source-ref: ${{ steps.resolve.outputs.source-ref }}
       source-sha: ${{ steps.resolve.outputs.source-sha }}
+      previous-desktop-sha: ${{ steps.resolve.outputs.previous-desktop-sha }}
       previous-source-sha: ${{ steps.resolve.outputs.previous-source-sha }}
       previous-resource-tag: ${{ steps.resolve.outputs.previous-resource-tag }}
       skip: ${{ steps.resolve.outputs.skip }}
@@ -52,6 +56,7 @@ jobs:
             const ref = process.env.SOURCE_REF_INPUT || config.defaultRef || 'main';
             const commit = await github.rest.repos.getCommit({ owner, repo, ref });
             const sourceSha = commit.data.sha;
+            const desktopSha = context.sha;
             const releases = await github.paginate(github.rest.repos.listReleases, {
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -63,28 +68,32 @@ jobs:
                 const body = r.body || '';
                 return {
                   release: r,
+                  desktopSha: body.match(/^Desktop-Commit:\s*([0-9a-f]{40})\s*$/mi)?.[1] || '',
                   sourceSha: body.match(/^Source-Commit:\s*([0-9a-f]{40})\s*$/mi)?.[1] || '',
                   resourceTag: body.match(/^Resource-Tag:\s*([A-Za-z0-9._-]+)\s*$/mi)?.[1] || '',
                 };
               })
-              .filter(r => r.sourceSha)
+              .filter(r => r.desktopSha && r.sourceSha)
               .sort((a, b) => Date.parse(b.release.published_at || b.release.created_at)
                 - Date.parse(a.release.published_at || a.release.created_at));
 
-            const previous = successful[0] || { sourceSha: '', resourceTag: '' };
+            const previous = successful[0] || { desktopSha: '', sourceSha: '', resourceTag: '' };
             const force = process.env.FORCE_BUILD === 'true';
-            const skip = sourceSha === previous.sourceSha && !force;
+            const skip = desktopSha === previous.desktopSha && sourceSha === previous.sourceSha && !force;
+            core.setOutput('desktop-sha', desktopSha);
             core.setOutput('source-repository', config.repository);
             core.setOutput('source-ref', ref);
             core.setOutput('source-sha', sourceSha);
+            core.setOutput('previous-desktop-sha', previous.desktopSha);
             core.setOutput('previous-source-sha', previous.sourceSha);
             core.setOutput('previous-resource-tag', previous.resourceTag);
             core.setOutput('skip', String(skip));
-            core.info(`Source: ${config.repository}@${ref} (${sourceSha})`);
+            core.info(`Desktop: ${context.repo.owner}/${context.repo.repo}@${desktopSha}`);
+            core.info(`Web: ${config.repository}@${ref} (${sourceSha})`);
             core.info(previous.sourceSha
-              ? `Last published source: ${previous.sourceSha}; resource release: ${previous.resourceTag || '(missing)'}`
+              ? `Last published desktop: ${previous.desktopSha}; web: ${previous.sourceSha}; resource release: ${previous.resourceTag || '(missing)'}`
               : 'No successful desktop release exists yet.');
-            core.info(skip ? 'No new source commit; skipping.' : 'A build is required.');
+            core.info(skip ? 'Both commits are already released; skipping.' : 'A build is required.');
 
   resources:
     needs: resolve
@@ -101,7 +110,7 @@ jobs:
         with:
           repository: ${{ needs.resolve.outputs.source-repository }}
           ref: ${{ needs.resolve.outputs.source-sha }}
-          path: source
+          path: web
           fetch-depth: 1
           persist-credentials: false
 
@@ -114,17 +123,17 @@ jobs:
         env:
           PREVIOUS_RESOURCE_TAG: ${{ needs.resolve.outputs.previous-resource-tag }}
         run: |
-          python scripts/resource_changed.py source "$PREVIOUS_RESOURCE_TAG" >> "$GITHUB_OUTPUT"
+          python scripts/resource_changed.py web "$PREVIOUS_RESOURCE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Build a changed resource pack
         id: pack
         if: steps.change.outputs.changed == 'true'
         run: |
-          python source/scripts/pack-resources.py
+          python scripts/pack-resources.py
 
-          zip_file=$(find source/offline-release -maxdepth 1 -type f -name '*.zip' -print -quit)
-          manifest_file=$(find source/offline-release -maxdepth 1 -type f -name '*.manifest.json' -print -quit)
-          checksum_file=$(find source/offline-release -maxdepth 1 -type f -name '*.zip.sha256' -print -quit)
+          zip_file=$(find offline-release -maxdepth 1 -type f -name '*.zip' -print -quit)
+          manifest_file=$(find offline-release -maxdepth 1 -type f -name '*.manifest.json' -print -quit)
+          checksum_file=$(find offline-release -maxdepth 1 -type f -name '*.zip.sha256' -print -quit)
           test -n "$zip_file" && test -n "$manifest_file" && test -n "$checksum_file"
 
           resource_id=$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["id"])' "$manifest_file")
@@ -149,9 +158,9 @@ jobs:
           RESOURCE_ID: ${{ steps.pack.outputs.resource_id }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
         run: |
-          zip_file=$(find source/offline-release -maxdepth 1 -type f -name '*.zip' -print -quit)
-          manifest_file=$(find source/offline-release -maxdepth 1 -type f -name '*.manifest.json' -print -quit)
-          checksum_file=$(find source/offline-release -maxdepth 1 -type f -name '*.zip.sha256' -print -quit)
+          zip_file=$(find offline-release -maxdepth 1 -type f -name '*.zip' -print -quit)
+          manifest_file=$(find offline-release -maxdepth 1 -type f -name '*.manifest.json' -print -quit)
+          checksum_file=$(find offline-release -maxdepth 1 -type f -name '*.zip.sha256' -print -quit)
 
           if gh release view "$RESOURCE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json isDraft,assets --jq '{isDraft: .isDraft, assets: [.assets[].name]}' \
@@ -206,7 +215,7 @@ jobs:
         with:
           repository: ${{ needs.resolve.outputs.source-repository }}
           ref: ${{ needs.resolve.outputs.source-sha }}
-          path: source
+          path: web
           fetch-depth: 1
           persist-credentials: false
 
@@ -214,24 +223,28 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: source/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Install JavaScript dependencies
-        working-directory: source
+        run: npm ci
+
+      - name: Install web dependencies
+        working-directory: web
         run: npm ci
 
       - name: Build universal macOS app and DMG
-        working-directory: source
         run: npm run desktop:build:macos -- --bundles app,dmg --ci
 
       - uses: actions/upload-artifact@v7
         with:
-          name: macos-dmg-${{ needs.resolve.outputs.source-sha }}
-          path: source/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          name: macos-dmg-${{ needs.resolve.outputs.desktop-sha }}-${{ needs.resolve.outputs.source-sha }}
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
           retention-days: 7
 
@@ -246,7 +259,7 @@ jobs:
         with:
           repository: ${{ needs.resolve.outputs.source-repository }}
           ref: ${{ needs.resolve.outputs.source-sha }}
-          path: source
+          path: web
           fetch-depth: 1
           persist-credentials: false
 
@@ -254,7 +267,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: source/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -264,17 +279,19 @@ jobs:
         run: choco install nsis --yes --no-progress
 
       - name: Install JavaScript dependencies
-        working-directory: source
+        run: npm ci
+
+      - name: Install web dependencies
+        working-directory: web
         run: npm ci
 
       - name: Build Windows x64 installer with offline WebView2 runtime
-        working-directory: source
         run: npm run desktop:build:windows -- --ci
 
       - uses: actions/upload-artifact@v7
         with:
-          name: windows-x64-${{ needs.resolve.outputs.source-sha }}
-          path: source/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*_x64-setup.exe
+          name: windows-x64-${{ needs.resolve.outputs.desktop-sha }}-${{ needs.resolve.outputs.source-sha }}
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*_x64-setup.exe
           if-no-files-found: error
           retention-days: 7
 
@@ -291,7 +308,7 @@ jobs:
         with:
           repository: ${{ needs.resolve.outputs.source-repository }}
           ref: ${{ needs.resolve.outputs.source-sha }}
-          path: source
+          path: web
           fetch-depth: 1
           persist-credentials: false
 
@@ -301,17 +318,18 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: macos-dmg-${{ needs.resolve.outputs.source-sha }}
+          name: macos-dmg-${{ needs.resolve.outputs.desktop-sha }}-${{ needs.resolve.outputs.source-sha }}
           path: artifacts/macos
 
       - uses: actions/download-artifact@v8
         with:
-          name: windows-x64-${{ needs.resolve.outputs.source-sha }}
+          name: windows-x64-${{ needs.resolve.outputs.desktop-sha }}-${{ needs.resolve.outputs.source-sha }}
           path: artifacts/windows
 
       - name: Prepare checksums and release notes
         id: metadata
         env:
+          DESKTOP_SHA: ${{ needs.resolve.outputs.desktop-sha }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source-sha }}
           RESOURCE_TAG: ${{ needs.resources.outputs.tag }}
         run: |
@@ -319,8 +337,8 @@ jobs:
           windows_exe=$(find artifacts/windows -maxdepth 1 -type f -name '*.exe' -print -quit)
           test -n "$mac_dmg" && test -n "$windows_exe"
 
-          version=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("source/src-tauri/tauri.conf.json", "utf8")).version)')
-          release_tag="desktop-v${version}-${SOURCE_SHA:0:12}-run${GITHUB_RUN_NUMBER}-attempt${GITHUB_RUN_ATTEMPT}"
+          version=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("src-tauri/tauri.conf.json", "utf8")).version)')
+          release_tag="desktop-v${version}-${DESKTOP_SHA:0:12}-${SOURCE_SHA:0:12}-run${GITHUB_RUN_NUMBER}-attempt${GITHUB_RUN_ATTEMPT}"
           python - "$mac_dmg" "$windows_exe" <<'PY'
           import pathlib, sys
           limit = 2 * 1024**3
@@ -360,12 +378,13 @@ jobs:
 
           [下载资源包](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RESOURCE_TAG})
 
+          Desktop-Commit: ${DESKTOP_SHA}
           Source-Commit: ${SOURCE_SHA}
           Resource-Tag: ${RESOURCE_TAG}
           EOF
 
           echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
-          echo "title=Splatoon Blender ${version} (${SOURCE_SHA:0:12})" >> "$GITHUB_OUTPUT"
+          echo "title=Splatoon Blender ${version} (${DESKTOP_SHA:0:7} · ${SOURCE_SHA:0:7})" >> "$GITHUB_OUTPUT"
           echo "mac_dmg=artifacts/$mac_name" >> "$GITHUB_OUTPUT"
           echo "windows_exe=artifacts/$windows_name" >> "$GITHUB_OUTPUT"
 

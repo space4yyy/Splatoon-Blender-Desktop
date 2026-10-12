@@ -1,0 +1,25 @@
+{
+  "build": {
+    "frontendDist": "http://splatoon.localhost/index.html"
+  },
+  "bundle": {
+    "targets": [
+      "nsis"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller"
+      },
+      "nsis": {
+        "template": "installer/windows.nsi",
+        "languages": [
+          "English",
+          "SimpChinese",
+          "Japanese"
+        ],
+        "displayLanguageSelector": true,
+        "compression": "zlib"
+      }
+    }
+  }
+}
